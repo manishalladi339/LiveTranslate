@@ -45,6 +45,7 @@ function App() {
   const [provider, setProvider] = useState('connecting')
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
   const socketRef = useRef<WebSocket | null>(null)
+  const pendingRef = useRef<{ id: string; text: string; timer?: ReturnType<typeof setTimeout> } | null>(null)
   const historyRef = useRef<HTMLDivElement | null>(null)
 
   const sourceLanguage = useMemo(() => languages.find((item) => item.code === source), [languages, source])
@@ -69,22 +70,42 @@ function App() {
     const socket = new WebSocket(`${apiHost}/api/v1/live/${crypto.randomUUID()}`)
     socketRef.current = socket
     socket.onopen = () => setConnected(true)
-    socket.onclose = () => setConnected(false)
+    function failPending(message: string) {
+      const pending = pendingRef.current
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingRef.current = null
+      setText(pending.text)
+      setIsTranslating(false)
+      setError(message)
+    }
+    socket.onclose = () => {
+      setConnected(false)
+      failPending('Connection interrupted. Your message is restored; try again using text mode.')
+    }
     socket.onerror = () => setError('Live connection unavailable. Text translation still works.')
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data)
       if (message.type === 'translation') {
+        const pending = pendingRef.current
+        if (!pending || pending.id !== message.turn_id) return
+        clearTimeout(pending.timer)
+        pendingRef.current = null
         setHistory((items) => [
           ...items,
           { ...message, id: message.turn_id ?? crypto.randomUUID(), createdAt: new Date().toISOString() },
         ])
         setIsTranslating(false)
       } else if (message.type === 'error') {
-        setError(message.message)
-        setIsTranslating(false)
+        failPending(message.message)
       }
     }
-    return () => socket.close()
+    return () => {
+      clearTimeout(pendingRef.current?.timer)
+      recognitionRef.current?.stop()
+      window.speechSynthesis?.cancel()
+      socket.close()
+    }
   }, [])
 
   useEffect(() => {
@@ -93,13 +114,21 @@ function App() {
 
   async function translate(value: string) {
     const cleaned = value.trim()
-    if (!cleaned || isTranslating) return
+    if (!cleaned || pendingRef.current) return
     setError('')
     setText('')
     setInterim('')
     setIsTranslating(true)
     const turnId = crypto.randomUUID()
+    pendingRef.current = { id: turnId, text: cleaned }
     if (socketRef.current?.readyState === WebSocket.OPEN) {
+      pendingRef.current.timer = setTimeout(() => {
+        if (pendingRef.current?.id !== turnId) return
+        pendingRef.current = null
+        setText(cleaned)
+        setIsTranslating(false)
+        setError('Translation timed out. Your message is restored; please try again.')
+      }, 30000)
       socketRef.current.send(
         JSON.stringify({
           type: 'translate',
@@ -117,13 +146,16 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: cleaned, source_language: source, target_language: target }),
+        signal: AbortSignal.timeout(30000),
       })
-      if (!response.ok) throw new Error('Translation failed')
       const result = await response.json()
+      if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Translation failed')
       setHistory((items) => [...items, { ...result, id: turnId, createdAt: new Date().toISOString() }])
-    } catch {
-      setError('Could not translate. Check that the API is running and try again.')
+    } catch (cause) {
+      setText(cleaned)
+      setError(cause instanceof Error ? cause.message : 'Could not translate. Please try again.')
     } finally {
+      pendingRef.current = null
       setIsTranslating(false)
     }
   }
@@ -145,7 +177,7 @@ function App() {
       return
     }
     const recognition = new SpeechRecognition()
-    recognition.continuous = true
+    recognition.continuous = false
     recognition.interimResults = true
     recognition.lang = sourceLanguage?.speech_code ?? 'en-US'
     recognition.onresult = (event: SpeechRecognitionEventLike) => {
@@ -218,23 +250,24 @@ function App() {
           <div className="eyebrow"><MessageCircleMore size={16} /> Real-time conversation workspace</div>
           <h1>Speak naturally.<br /><span>Be understood anywhere.</span></h1>
           <p>Instant speech-to-text translation with voice playback, built for fluid conversations across languages.</p>
-          <div className="trust"><ShieldCheck size={17} /> Audio stays in your browser. Only transcribed text reaches the translation API.</div>
+          <div className="trust"><ShieldCheck size={17} /> Our backend receives text. Browser speech recognition may send audio to its provider’s servers.</div>
+          {provider === 'demo' && <p>Demo phrasebook: try the sample phrases from English to Spanish, Hindi, Telugu or French. Full translation requires a configured provider.</p>}
         </section>
 
         <section className="workspace" aria-label="Translation workspace">
           <div className="language-bar">
             <label>
               <span>You speak</span>
-              <select value={source} onChange={(event) => setSource(event.target.value)}>
+              <select disabled={isListening || isTranslating} value={source} onChange={(event) => setSource(event.target.value)}>
                 {languages.filter((language) => language.code !== target).map((language) => (
                   <option key={language.code} value={language.code}>{language.name}</option>
                 ))}
               </select>
             </label>
-            <button className="swap" type="button" onClick={swapLanguages} aria-label="Swap languages"><ArrowRightLeft size={20} /></button>
+            <button className="swap" type="button" disabled={isListening || isTranslating} onClick={swapLanguages} aria-label="Swap languages"><ArrowRightLeft size={20} /></button>
             <label>
               <span>Translate to</span>
-              <select value={target} onChange={(event) => setTarget(event.target.value)}>
+              <select disabled={isListening || isTranslating} value={target} onChange={(event) => setTarget(event.target.value)}>
                 {languages.filter((language) => language.code !== source).map((language) => (
                   <option key={language.code} value={language.code}>{language.name}</option>
                 ))}
@@ -250,7 +283,7 @@ function App() {
                 <p>Tap the microphone and speak, or type a message below.</p>
                 <div className="prompts">
                   {['Hello', 'How are you?', 'Where is the train station?'].map((prompt) => (
-                    <button key={prompt} type="button" onClick={() => void translate(prompt)}>{prompt}</button>
+                    <button key={prompt} type="button" disabled={isListening || isTranslating} onClick={() => void translate(prompt)}>{prompt}</button>
                   ))}
                 </div>
               </div>
@@ -266,7 +299,7 @@ function App() {
                   <p>{item.translated}</p>
                   <div className="turn-actions">
                     <button type="button" onClick={() => speak(item)} aria-label="Listen"><Volume2 size={16} /> Listen</button>
-                    <button type="button" onClick={() => void navigator.clipboard.writeText(item.translated)} aria-label="Copy"><Copy size={16} /> Copy</button>
+                    <button type="button" onClick={() => { void navigator.clipboard?.writeText(item.translated).catch(() => setError('Copy unavailable. Select and copy the translation manually.')) }} aria-label="Copy"><Copy size={16} /> Copy</button>
                   </div>
                 </div>
               </article>
@@ -277,12 +310,12 @@ function App() {
           {error && <div className="error" role="alert">{error}</div>}
 
           <div className="composer-wrap">
-            <button className={`mic ${isListening ? 'listening' : ''}`} type="button" onClick={toggleListening} aria-label={isListening ? 'Stop listening' : 'Start listening'}>
+            <button className={`mic ${isListening ? 'listening' : ''}`} disabled={isTranslating && !isListening} type="button" onClick={toggleListening} aria-label={isListening ? 'Stop listening' : 'Start listening'}>
               {isListening ? <CircleStop size={25} /> : <Mic size={25} />}
             </button>
             <form className="composer" onSubmit={submit}>
-              <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={`Type in ${sourceLanguage?.name ?? 'your language'}…`} maxLength={2000} rows={1} />
-              <button className="send" type="submit" disabled={!text.trim() || isTranslating} aria-label="Translate">
+              <textarea aria-label="Message to translate" disabled={isListening || isTranslating} value={text} onChange={(event) => setText(event.target.value)} placeholder={`Type in ${sourceLanguage?.name ?? 'your language'}…`} maxLength={2000} rows={1} />
+              <button className="send" type="submit" disabled={!text.trim() || isTranslating || isListening} aria-label="Translate">
                 {isTranslating ? <span className="spinner" /> : <Send size={20} />}
               </button>
             </form>

@@ -1,6 +1,6 @@
 # LiveTranslate
 
-LiveTranslate is a privacy-aware, real-time translation workspace built as a portfolio-ready MVP. It turns browser speech into text, streams it to a FastAPI translation service, and can read the translation aloud without uploading raw microphone audio.
+LiveTranslate is a real-time translation workspace built as a portfolio MVP. It turns browser speech into text, sends it to a FastAPI translation service, and can read the translation aloud. LiveTranslate’s backend receives text; the browser’s speech provider may process audio remotely.
 
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.116-009688?logo=fastapi&logoColor=white)
@@ -32,7 +32,7 @@ flowchart LR
   G --> H[Browser speech playback]
 ```
 
-Raw microphone audio stays inside the browser. Browser speech recognition support and implementation vary by browser and operating system.
+Browser speech recognition may send audio to the browser vendor’s servers. Support and implementation vary by browser and operating system. Conversation history is held in page memory and disappears on reload unless exported. The configured translation provider receives the submitted text.
 
 ## Run locally
 
@@ -69,7 +69,7 @@ Open [http://localhost:5173](http://localhost:5173).
 
 ## Enable full translation
 
-The demo provider translates a small phrasebook and clearly labels unmatched content. To translate arbitrary text, set:
+The demo provider supports five phrases between English and Spanish, Hindi, Telugu or French (including reverse lookup). Unsupported text returns an explicit error; it is never presented as a translation. To translate arbitrary text, set these backend environment variables (or copy the root `.env` into `backend/.env` for the development command above):
 
 ```env
 TRANSLATION_PROVIDER=openai
@@ -78,6 +78,8 @@ OPENAI_MODEL=gpt-5-mini
 ```
 
 Restart the backend after changing environment variables. Never commit `.env` or expose the API key to the frontend.
+
+Microphone input captures one utterance per tap. Language controls are locked during capture or translation. Failed or timed-out requests restore the submitted text; if the WebSocket disconnects, subsequent requests use REST.
 
 ## Test and build
 
@@ -98,7 +100,8 @@ The included Dockerfiles support a two-service deployment:
 
 For the simplest single-host setup, deploy `docker-compose.yml` on a small VM and terminate TLS with a reverse proxy such as Caddy.
 
+Paid-provider requests are capped at 30 per minute and two in flight per backend process, across REST and WebSocket. Run one backend worker for this MVP. Keep public portfolio demos in phrasebook mode; put a paid-provider deployment behind access control and configure provider spending limits. The built-in process limit is not a distributed quota or user authentication system.
+
 ## Product boundaries
 
 This MVP is intended for everyday conversation, not emergency, legal, medical, or safety-critical interpretation. Translation quality depends on the configured provider, and browser speech recognition is not available on every browser.
-

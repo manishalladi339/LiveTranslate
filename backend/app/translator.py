@@ -1,5 +1,6 @@
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import httpx
@@ -48,15 +49,30 @@ class TranslationResult:
     is_demo: bool
 
 
+class TranslationBusyError(RuntimeError):
+    pass
+
+
 class Translator:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.requests: deque[float] = deque()
+        self.inflight = 0
 
     async def translate(self, text: str, source: str, target: str) -> TranslateResponse:
         validate_pair(source, target)
         started = time.perf_counter()
         if self.settings.translation_provider == "openai":
-            result = await self._openai(text, source, target)
+            while self.requests and started - self.requests[0] >= 60:
+                self.requests.popleft()
+            if len(self.requests) >= 30 or self.inflight >= 2:
+                raise TranslationBusyError("Translation capacity reached. Try again shortly.")
+            self.requests.append(started)
+            self.inflight += 1
+            try:
+                result = await self._openai(text, source, target)
+            finally:
+                self.inflight -= 1
         else:
             result = self._demo(text, source, target)
         latency = round((time.perf_counter() - started) * 1000)
@@ -81,12 +97,7 @@ class Translator:
         if reverse:
             return TranslationResult(reverse.capitalize(), "demo phrasebook", True)
 
-        target_name = LANGUAGE_MAP[target].name
-        return TranslationResult(
-            f"[{target_name} demo] {text}",
-            "demo fallback",
-            True,
-        )
+        raise ValueError("Phrase unavailable in demo mode. Try Hello from English to Spanish, Hindi, Telugu or French, or enable the OpenAI provider.")
 
     async def _openai(self, text: str, source: str, target: str) -> TranslationResult:
         if not self.settings.openai_api_key:
@@ -107,7 +118,6 @@ class Translator:
                 {"role": "user", "content": text},
             ],
             "response_format": {"type": "json_object"},
-            "temperature": 0.1,
         }
         headers = {"Authorization": f"Bearer {self.settings.openai_api_key}"}
         async with httpx.AsyncClient(timeout=25) as client:
@@ -115,9 +125,14 @@ class Translator:
                 "https://api.openai.com/v1/chat/completions", json=payload, headers=headers
             )
             response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        translated = json.loads(content)["translation"].strip()
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+            translated = json.loads(content)["translation"]
+            if not isinstance(translated, str):
+                raise TypeError("Expected a translation string")
+            translated = translated.strip()
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("Translation provider returned an invalid response") from exc
         if not translated:
             raise RuntimeError("Translation provider returned an empty response")
         return TranslationResult(translated, self.settings.openai_model, False)
-

@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .languages import LANGUAGES, validate_pair
 from .models import TranslateRequest, TranslateResponse
-from .translator import Translator
+from .translator import Translator, TranslationBusyError
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -44,6 +44,8 @@ async def translate(payload: TranslateRequest) -> TranslateResponse:
         return await get_translator().translate(
             payload.text, payload.source_language, payload.target_language
         )
+    except TranslationBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "60"}) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (httpx.HTTPError, RuntimeError, KeyError, TypeError) as exc:
@@ -53,21 +55,33 @@ async def translate(payload: TranslateRequest) -> TranslateResponse:
 
 @app.websocket("/api/v1/live/{session_id}")
 async def live_translate(websocket: WebSocket, session_id: str) -> None:
+    origin = websocket.headers.get("origin")
+    if origin and origin not in settings.allowed_origins:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     await websocket.send_json({"type": "ready", "session_id": session_id})
     try:
         while True:
-            message = await websocket.receive_json()
+            try:
+                message = await websocket.receive_json()
+            except ValueError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                continue
+            if not isinstance(message, dict):
+                await websocket.send_json({"type": "error", "message": "Expected a JSON object"})
+                continue
             if message.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
                 continue
             if message.get("type") != "translate":
                 await websocket.send_json({"type": "error", "message": "Unsupported message type"})
                 continue
-            text = str(message.get("text", "")).strip()
-            if not text or len(text) > settings.max_text_length:
+            text = message.get("text", "")
+            if not isinstance(text, str) or not text.strip() or len(text) > settings.max_text_length:
                 await websocket.send_json({"type": "error", "message": "Text must be 1–2000 characters"})
                 continue
+            text = text.strip()
             source = str(message.get("source_language", ""))
             target = str(message.get("target_language", ""))
             try:
@@ -81,7 +95,7 @@ async def live_translate(websocket: WebSocket, session_id: str) -> None:
                         **result.model_dump(),
                     }
                 )
-            except ValueError as exc:
+            except (ValueError, TranslationBusyError) as exc:
                 await websocket.send_json({"type": "error", "message": str(exc)})
             except Exception:
                 logger.exception("WebSocket translation failed")
